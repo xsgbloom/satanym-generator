@@ -1,0 +1,103 @@
+#!/bin/bash
+
+# ==============================================================================
+# Satanym: A deterministic name registry and generator service.
+# 
+# Deployment script for Google Cloud Run with automated artifact cleanup.
+# This script manages infrastructure, deployment, and cost-reduction purging.
+# ==============================================================================
+
+# 1. Configuration
+PROJECT_ID=$(gcloud config get-value project)
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+REGION="us-central1"
+BUCKET_NAME="satanym-generator"
+SERVICE_NAME="satanym-generator"
+SA_NAME="satanym-app-sa"
+SA_EMAIL="$SA_NAME@$PROJECT_ID.iam.gserviceaccount.com"
+DOMAIN_NAME="satanym.miscreants.org"
+PATH_NAME="/satanym"
+
+# Artifact Registry Path
+REPO_PATH="$REGION-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME"
+
+echo "--- Starting Ritual Deployment for: $PROJECT_ID ---"
+
+# 2. Enable APIs
+echo "Ensuring APIs are active..."
+gcloud services enable \
+    run.googleapis.com \
+    storage.googleapis.com \
+    cloudbuild.googleapis.com \
+    artifactregistry.googleapis.com
+
+# 3. Service Account Setup
+if ! gcloud iam service-accounts describe "$SA_EMAIL" >/dev/null 2>&1; then
+  echo "Creating application service account..."
+  gcloud iam service-accounts create "$SA_NAME" \
+      --display-name="Satanym App Service Account"
+fi
+
+# 4. Storage Setup
+if ! gsutil ls -b "gs://$BUCKET_NAME" >/dev/null 2>&1; then
+  echo "Provisioning GCS bucket: $BUCKET_NAME"
+  gsutil mb -l "$REGION" "gs://$BUCKET_NAME"
+  # Hard-disable versioning to ensure we stay in the free tier
+  gsutil versioning set off "gs://$BUCKET_NAME"
+fi
+
+# Apply Least Privilege: grant objectAdmin only to this specific bucket
+gsutil iam ch "serviceAccount:$SA_EMAIL:roles/storage.objectAdmin" "gs://$BUCKET_NAME"
+
+# 5. Deployment
+echo "Uploading source and deploying to Cloud Run..."
+# We use '^' as a custom delimiter to allow commas within the ALLOWED_HOSTS value.
+gcloud run deploy "$SERVICE_NAME" \
+    --source . \
+    --region "$REGION" \
+    --service-account "$SA_EMAIL" \
+    --min-instances 0 \
+    --max-instances 1 \
+    --allow-unauthenticated \
+    --set-env-vars "^|^BUCKET_NAME=$BUCKET_NAME|SEED_LIMIT=666|ALLOWED_HOSTS=$DOMAIN_NAME,localhost|RITUAL_PATH=$PATH_NAME"
+
+# 6. Domain Mapping
+if ! gcloud beta run domain-mappings describe --domain "$DOMAIN_NAME" --region "$REGION" >/dev/null 2>&1; then
+  echo "Mapping custom domain: $DOMAIN_NAME"
+  gcloud beta run domain-mappings create --service "$SERVICE_NAME" --domain "$DOMAIN_NAME" --region "$REGION"
+fi
+
+# 7. ARTIFACT CLEANUP (Cost Management)
+echo "--- Initiating Artifact Purge (Keeping project 'Close to Free') ---"
+
+# A. Prune Artifact Registry
+# We list digests sorted by time (descending) and delete everything after the 3rd index.
+echo "Cleaning old container images..."
+DIGESTS=($(gcloud artifacts docker images list "$REPO_PATH" \
+    --sort-by=~CREATE_TIME --format='value(digest)'))
+
+if [ ${#DIGESTS[@]} -gt 3 ]; then
+    # Slice the array to get all digests starting from index 3
+    OLD_DIGESTS=("${DIGESTS[@]:3}")
+    for digest in "${OLD_DIGESTS[@]}"; do
+        echo "Deleting stale digest: $digest"
+        gcloud artifacts docker images delete "$REPO_PATH@$digest" --quiet --delete-tags
+    done
+else
+    echo "No old images to prune."
+fi
+
+# B. Clean Cloud Build Tars
+# Source code tars are stored in this bucket; we wipe them to save GCS space.
+BUILD_BUCKET="gs://${PROJECT_NUMBER}_cloudbuild"
+echo "Clearing build source shards from $BUILD_BUCKET..."
+if gsutil ls "$BUILD_BUCKET" >/dev/null 2>&1; then
+    gsutil -m rm -r "$BUILD_BUCKET/source/**" >/dev/null 2>&1
+fi
+
+# 8. Final DNS Instruction
+echo "--------------------------------------------------------"
+echo "Deployment and Cleanup Successful."
+echo "Ensure your CNAME points to the following GFE target:"
+gcloud beta run domain-mappings describe --domain "$DOMAIN_NAME" --region "$REGION" --format='value(status.resourceRecords)'
+echo "--------------------------------------------------------"
